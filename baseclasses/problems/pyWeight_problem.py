@@ -199,12 +199,16 @@ class WeightProblem:
             File name for tecplot file. Should have a .dat extension.
 
         """
-        # Build the FETriangle data array
-        dataArrays = np.zeros((len(self.p0) * 3, 3), dtype=float)
-        dataArrays[::3] = self.p0
-        dataArrays[1::3] = self.p0 + self.v1
-        dataArrays[2::3] = self.p0 + self.v2
-        data = {"CoordinateX": dataArrays[:, 0], "CoordinateY": dataArrays[:, 1], "CoordinateZ": dataArrays[:, 2]}
+        # Build the FETriangle data arrays
+        x = np.zeros((len(self.p0) * 3), dtype=float)
+        y = np.zeros((len(self.p0) * 3), dtype=float)
+        z = np.zeros((len(self.p0) * 3), dtype=float)
+
+        x[::3], x[1::3], x[2::3] = self.p0[:, 0], self.p0[:, 0] + self.v1[:, 0], self.p0[:, 0] + self.v2[:, 0]
+        y[::3], y[1::3], y[2::3] = self.p0[:, 1], self.p0[:, 1] + self.v1[:, 1], self.p0[:, 1] + self.v2[:, 1]
+        z[::3], z[1::3], z[2::3] = self.p0[:, 2], self.p0[:, 2] + self.v1[:, 2], self.p0[:, 2] + self.v2[:, 2]
+
+        data = {"CoordinateX": x, "CoordinateY": y, "CoordinateZ": z}
 
         # Create the connectivity
         conn = np.zeros((len(self.p0), 3), dtype=int)
@@ -499,7 +503,7 @@ class WeightProblem:
 
         filename: str
             filename for writing the masses. This string will have the
-            # .dat suffix appended to it if it does not already have it.
+            .dat suffix appended to it if it does not already have it.
         """
 
         nMasses = len(self.nameList)
