@@ -1,9 +1,10 @@
 import re
 import struct
 from abc import ABC, abstractmethod
-from enum import Enum
+from dataclasses import dataclass, field, fields
+from enum import Enum, EnumMeta
 from pathlib import Path
-from typing import Any, Dict, Generic, List, Literal, TextIO, Tuple, TypeVar, Union
+from typing import Any, Dict, Generic, List, Literal, Optional, Set, TextIO, Tuple, TypeVar, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -26,6 +27,9 @@ class ZoneType(Enum):
     FEBRICK = 5
 
 
+FEZones = [ZoneType.FELINESEG, ZoneType.FETRIANGLE, ZoneType.FEQUADRILATERAL, ZoneType.FETETRAHEDRON, ZoneType.FEBRICK]
+
+
 class DataPacking(Enum):
     """Tecplot data packing formats"""
 
@@ -36,9 +40,8 @@ class DataPacking(Enum):
 class VariableLocation(Enum):
     """Grid location of the variable data"""
 
-    NODE = 0
-    CELL_CENTER = 1
-    NODE_AND_CELL_CENTER = 2
+    NODAL = 0
+    CELLCENTERED = 1
 
 
 class DataPrecision(Enum):
@@ -55,11 +58,15 @@ class BinaryDataPrecisionCodes(Enum):
     DOUBLE = 2
 
 
-class DTypePrecision(Enum):
-    """Numpy data types for single and double precision"""
+class DataType(Enum):
+    """Data types for variable data"""
 
     SINGLE = np.float32
     DOUBLE = np.float64
+    LONGINT = np.int32
+    SHORTINT = np.int16
+    BYTE = np.int8
+    BIT = bool
 
 
 class FileType(Enum):
@@ -112,256 +119,132 @@ class Separator(Enum):
 # DATA STRUCTURES
 # ==============================================================================
 class TecplotZone:
-    """Base class for Tecplot zones."""
-
     def __init__(
         self,
-        name: str,
-        data: Dict[str, npt.NDArray],
-        solutionTime: float = 0.0,
-        strandID: int = -1,
+        title: str,
+        data: npt.NDArray,
+        variables: List[str],
+        sharedVariables: List[int],
+        passiveVariables: List[bool],
+        zoneType: ZoneType = ZoneType.UNSET,
+        connectivity: Optional[npt.NDArray] = None,
+        connectivityShareZone: Optional[int] = None,
+        dataType: DataType = DataType.DOUBLE,
+        dataPacking: DataPacking = DataPacking.POINT,
+        varLocation: VariableLocation = VariableLocation.NODAL,
+        strandID: Optional[int] = None,
+        solutionTime: Optional[Union[float, int]] = None,
+        auxData: Optional[Dict[str, str]] = None,
     ):
-        """Create a tecplot zone object.
+        """Create a tecplot zone object."""
+        if not isinstance(title, str):
+            raise TypeError("Title must be a string.")
 
-        Parameters
-        ----------
-        name : str
-            The name of the zone.
-        data : Dict[str, npt.NDArray]
-            A dictionary of variable names and their corresponding data.
-        solutionTime : float, optional
-            The solution time of the zone, by default 0.0
-        strandID : int, optional
-            The strand id of the zone, by default -1
-        """
-        self.name = name
+        if not isinstance(data, np.ndarray):
+            raise TypeError("Data must be a numpy ndarray.")
+
+        if not isinstance(variables, list) or not all(isinstance(var, str) for var in variables):
+            raise TypeError("Variables must be a list of strings.")
+
+        if not isinstance(sharedVariables, list) or not all(isinstance(var, int) for var in sharedVariables):
+            raise TypeError("Shared variables must be a list of integers.")
+
+        if not isinstance(passiveVariables, list) or not all(isinstance(var, bool) for var in passiveVariables):
+            raise TypeError("Passive variables must be a list of booleans.")
+
+        if zoneType not in ZoneType:
+            raise TypeError(f"Zone type must be one of {list(ZoneType)}.")
+
+        if dataType not in DataType:
+            raise TypeError(f"Data type must be one of {list(DataType)}.")
+
+        if dataPacking not in DataPacking:
+            raise TypeError(f"Data packing must be one of {list(DataPacking)}.")
+
+        if varLocation not in VariableLocation:
+            raise TypeError(f"Variable location must be one of {list(VariableLocation)}.")
+
+        if strandID is not None:
+            if not isinstance(strandID, int):
+                raise TypeError("Strand ID must be an integer.")
+
+        if solutionTime is not None:
+            if not isinstance(solutionTime, (float, int)):
+                raise TypeError("Solution time must be a float or int.")
+
+        if connectivity is not None and zoneType not in FEZones:
+            raise TypeError(f"Connectivty provided for non-FE zone type: {zoneType.name}.")
+
+        # Connectivity must be either None or a 2D numpy array of integers
+        if connectivity is not None:
+            if not isinstance(connectivity, np.ndarray):
+                raise TypeError("Connectivity must be a numpy ndarray.")
+            if connectivity.ndim != 2 or connectivity.dtype.kind not in "iu":
+                raise TypeError("Connectivity must be a 2D array of integers.")
+
+        if connectivityShareZone is not None:
+            if not isinstance(connectivityShareZone, int):
+                raise TypeError("Connectivity share zone must be an integer.")
+
+        if zoneType in FEZones:
+            if connectivityShareZone is None and connectivity is None:
+                raise ValueError("Either 'connectivityShareZone' or 'connectivity' must be provided for FE zones.")
+            elif connectivityShareZone is not None and connectivity is not None:
+                raise ValueError("If 'connectivityShareZone' is provided, 'connectivity' must be None.")
+
+        if auxData is not None:
+            if not isinstance(auxData, dict):
+                raise TypeError("Auxiliary data must be a dictionary.")
+            if not all(isinstance(key, str) and isinstance(value, str) for key, value in auxData.items()):
+                raise TypeError("Auxiliary data keys and values must be strings.")
+
+        self.title = title
         self.data = data
-        self.solutionTime = solutionTime
-        self.strandID = strandID
-        self.zoneType: Union[str, ZoneType] = ZoneType.UNSET
-        self._validateName()
-        self._validateData()
-        self._validateSolutionTime()
-        self._validateStrandID()
-
-    @property
-    def variables(self) -> List[str]:
-        return list(self.data.keys())
-
-    @property
-    def shape(self) -> Tuple[int, ...]:
-        return self.data[self.variables[0]].shape
-
-    @property
-    def nNodes(self) -> int:
-        return np.multiply.reduce(self.shape)
-
-    def _validateName(self) -> None:
-        """Check that the zone name is a valid string.
-
-        Raises
-        ------
-        TypeError
-            If the zone name is not a valid string.
-        """
-        if not isinstance(self.name, str):
-            raise TypeError("Zone name must be a string.")
-
-    def _validateData(self) -> None:
-        """Check that the data is a valid dictionary and the values
-        are numpy arrays that have the same shape.
-
-        Raises
-        ------
-        TypeError
-            If the data is not a dictionary or the values are not numpy
-            arrays.
-        ValueError
-            If the variables do not have the same shape.
-        """
-        if not isinstance(self.data, dict):
-            raise TypeError("Data must be a dictionary.")
-
-        for val in self.data.values():
-            if not isinstance(val, np.ndarray):
-                raise TypeError("Data values must be numpy arrays.")
-
-        if not all(self.data[var].shape == self.shape for var in self.variables):
-            raise ValueError("All variables must have the same shape.")
-
-    def _validateSolutionTime(self) -> None:
-        """Check that the solution time is a valid float.
-
-        Raises
-        ------
-        TypeError
-            If the solution time is not a float.
-        ValueError
-            If the solution time is less than zero.
-        """
-        if not isinstance(self.solutionTime, float):
-            raise TypeError("Solution time must be a float.")
-
-        if self.solutionTime < 0.0:
-            raise ValueError("Solution time must be greater than or equal to zero.")
-
-    def _validateStrandID(self) -> None:
-        """Check that the strand ID is a valid integer.
-
-        Raises
-        ------
-        TypeError
-            If the strand ID is not an integer.
-        """
-        if not isinstance(self.strandID, int):
-            raise TypeError("Strand ID must be an integer.")
-
-
-class TecplotOrderedZone(TecplotZone):
-    """Tecplot ordered zone. These zones do not contain connectivity
-    information because the data is ordered in an (i, j, k) grid.
-    """
-
-    def __init__(
-        self,
-        name: str,
-        data: Dict[str, npt.NDArray],
-        solutionTime: float = 0.0,
-        strandID: int = -1,
-    ):
-        """To create a tecplot ordered zone object:
-
-        .. code-block:: python
-
-            # --- Example usage ---
-            # Create the data
-            nx, ny = 10, 10
-            X = np.random.rand(nx, ny)
-            Y = np.random.rand(nx, ny)
-
-            # Create the zone
-            zone = TecplotOrderedZone(
-                "OrderedZone",
-                {"X": X, "Y": Y},
-                solutionTime=0.0,
-                strandID=-1,
-            )
-
-        Parameters
-        ----------
-        name : str
-            The name of the zone.
-        data : Dict[str, npt.NDArray]
-            A dictionary of variable names and their corresponding data.
-        zoneType : Union[str, ZoneType], optional
-            The type of the zone, by default ZoneType.ORDERED
-        solutionTime : float, optional
-            The solution time of the zone, by default 0.0
-        strandID : int, optional
-            The strand id of the zone, by default -1
-        """
-        super().__init__(name, data, solutionTime=solutionTime, strandID=strandID)
-        self.zoneType = ZoneType.ORDERED
-
-    @property
-    def iMax(self) -> int:
-        return self.shape[0]
-
-    @property
-    def jMax(self) -> int:
-        return self.shape[1] if len(self.shape) > 1 else 1
-
-    @property
-    def kMax(self) -> int:
-        return self.shape[2] if len(self.shape) > 2 else 1
-
-
-class TecplotFEZone(TecplotZone):
-    """Tecplot finite element zone. These zones contain connectivity
-    information to describe the elements in the zone. The type of
-    element is determined by the shape of the connectivity array and
-    the ``tetrahedral`` flag. The connectivity array is 0-based.
-
-    The following shapes correspond to the following element types,
-    where n is the number of elements:
-
-    - ``(n, 2)``: FELINESEG
-    - ``(n, 3)``: FETRIANGLE
-    - ``(n, 4)``, FEQUADRILATERAL
-    - ``(n, 4)``, FETETRAHEDRON
-    - ``(n, 8)``: FEBRICK
-    """
-
-    def __init__(
-        self,
-        zoneName: str,
-        data: Dict[str, npt.NDArray],
-        connectivity: npt.NDArray,
-        zoneType: Union[str, ZoneType],
-        solutionTime: float = 0.0,
-        strandID: int = -1,
-    ):
-        """To create a tecplot finite element zone object:
-
-        .. code-block:: python
-
-            # --- Example usage ---
-            # Create node coordinates
-            x = np.linspace(0, 1, nx + 1)
-            nodes = np.column_stack((x, x**2))
-
-            # Create element connectivity
-            connectivity = np.column_stack((np.arange(nx), np.arange(1, nx + 1)))
-
-            # Create the zone
-            zone = TecplotFEZone(
-                "FEZone",
-                {"x": nodes[:, 0], "y": nodes[:, 1]},
-                connectivity,
-                zoneType="FELINESEG",
-                solutionTime=0.0,
-                strandID=-1,
-            )
-
-        Parameters
-        ----------
-        zoneName : str
-            The name of the zone.
-        data : Dict[str, npt.NDArray]
-            A dictionary of variable names and their corresponding data.
-        connectivity : npt.NDArray
-            The connectivity array that describes the elements in the
-            zone.
-        zoneType : Union[str, ZoneType]
-            The type of the zone. Can be a string that matches an entry
-            in the ZoneType enum or the ZoneType enum itself.
-        solutionTime : float, optional
-            The solution time of the zone, by default 0.0
-        strandID : int, optional
-            The strand id of the zone, by default -1
-        """
-        super().__init__(zoneName, data, solutionTime=solutionTime, strandID=strandID)
-        self._connectivity = connectivity
         self.zoneType = zoneType
-        self._validateZoneType()
-        self._validateConnectivity()
-        self._uniqueIndices = np.unique(self._connectivity.flatten())
-        self._uniqueConnectivity = self._remapConnectivity()
+        self.passiveVariables = passiveVariables
 
-    @property
-    def connectivity(self) -> npt.NDArray:
-        return self._connectivity
+        # --- Validate and set connectivity ---
+        self.connectivity = connectivity
+        self.connectivityShareZone = connectivityShareZone
+        self.uniqueIndices = None
+        self.uniqueConnectivity = None
+        if connectivity is not None:
+            self._validateConnectivity()
+            self.uniqueIndices = np.unique(connectivity.flatten())
+            self.uniqueConnectivity = self._remapConnectivity()
 
-    @connectivity.setter
-    def connectivity(self, value: npt.NDArray) -> None:
-        self._connectivity = value
-        self._validateConnectivity()
-        self._uniqueIndices = np.unique(self._connectivity.flatten())
-        self._uniqueConnectivity = self._remapConnectivity()
+        # --- Header attributes ---
+        self.dataType = dataType
+        self.dataPacking = dataPacking
+        self.varLocation = varLocation
+        self.strandID = strandID
+        self.solutionTime = solutionTime
+        self.auxData = auxData
 
-    @property
-    def nElements(self) -> int:
-        return self.connectivity.shape[0]
+        # --- Internal attributes ---
+        self._variables = variables  # Point to the dataset variables
+
+        # Get the global indices of the variables local to this zone
+        sharedVariablesIndices = np.array(sharedVariables, dtype=int).nonzero()[0]
+        self._localVariables = set(range(len(variables))) - set(sharedVariablesIndices)
+        self._localVariables = sorted(list(self._localVariables))
+        self._localToGlobalVariableMap = {il: ig for il, ig in enumerate(self._localVariables)}
+
+        # Validate the local variables and shared variables are consistent with the total variables
+        if len(sharedVariablesIndices) + len(self._localVariables) != len(variables):
+            raise ValueError(
+                f"Zone '{self.title}' has {len(sharedVariablesIndices)} shared variables and "
+                f"{len(self._localVariables)} local variables, but the total number of variables is {len(variables)}. "
+                "The sum of shared and local variables must match the total number of variables."
+            )
+
+        # Create a mapping of shared variables to their parent zone indices
+        self.sharedVariables = {}
+        for ivar, izone in enumerate(sharedVariables):
+            if izone not in self.sharedVariables:
+                self.sharedVariables[izone] = []
+
+            self.sharedVariables[izone].append(ivar)
 
     @property
     def triConnectivity(self) -> npt.NDArray:
@@ -371,26 +254,6 @@ class TecplotFEZone(TecplotZone):
             return np.row_stack((self.connectivity[:, [0, 1, 2]], self.connectivity[:, [0, 2, 3]]))
         else:
             raise TypeError(f"'triConnectivity' not supported for {self.zoneType.name} zone type.")
-
-    @property
-    def uniqueData(self) -> Dict[str, npt.NDArray]:
-        return {var: self.data[var][self._uniqueIndices] for var in self.variables}
-
-    @property
-    def uniqueConnectivity(self) -> npt.NDArray:
-        return self._uniqueConnectivity
-
-    def _validateZoneType(self) -> None:
-        supportedZones = [zone.name for zone in ZoneType if zone.name != "ORDERED"]
-        if isinstance(self.zoneType, str):
-            if self.zoneType.upper() not in supportedZones:
-                raise ValueError("Invalid zone type.")
-            self.zoneType = ZoneType[self.zoneType.upper()]
-        elif isinstance(self.zoneType, ZoneType):
-            if self.zoneType.name not in supportedZones:
-                raise ValueError("Invalid zone type.")
-        else:
-            raise ValueError("Invalid zone type.")
 
     def _validateConnectivity(self) -> None:
         if self.zoneType == ZoneType.FELINESEG:
@@ -406,13 +269,273 @@ class TecplotFEZone(TecplotZone):
         else:
             # Prior validation step should ensure we don't reach this point
             # but raise an error just in case.
-            raise TypeError("Invalid zone type.")
+            raise TypeError(
+                f"Zone type: {self.zoneType.name} and "
+                f"connectivity of shape {self.connectivity.shape} are not compatible."
+            )
 
     def _remapConnectivity(self) -> npt.NDArray:
-        # Create a remapping array that's as large as the maximum index
-        remap = np.full(self._uniqueIndices.max() + 1, -1, dtype=np.int64)
-        remap[self._uniqueIndices] = np.arange(len(self._uniqueIndices))
-        return remap[self._connectivity]
+        remap = np.full(self.uniqueIndices.max() + 1, -1, dtype=np.int64)
+        remap[self.uniqueIndices] = np.arange(len(self.uniqueIndices))
+        return remap[self.connectivity]
+
+
+class TecplotData:
+    def __init__(self, title: str, variables: List[str], zones: Optional[List[TecplotZone]] = None):
+        self.title = title
+        self.variables = variables
+        self._lowercaseVariables = [var.lower() for var in variables]
+        self.zones = zones or []
+        self._validateAllZones()
+        self._convertSharedVariablesToIndicesAllZones()
+        self._validateSharedZoneVariables()
+
+        # --- Internal attributes ---
+        # Map to relate zones to shared variables in other zones {zone_index: {shared_zone_index: {variable_indices}}}
+        # The 'variable_indices' are indices of the variables in the self.variables list.
+        self._sharedVariableMap: Dict[int, Dict[int, Set[int]]] = {}
+        self._zoneVariableOwnership: Dict[int, Set[int]] = {}
+
+        # The shapes of the data arrays in each zone
+        self._dataShapes: List[Tuple[int, ...]] = [zone.data.shape for zone in self.zones]
+
+    def __len__(self) -> int:
+        return len(self.zones)
+
+    def __getitem__(self, index: int) -> TecplotZone:
+        if index < 0 or index >= len(self.zones):
+            raise IndexError("Zone index out of range.")
+        return self.zones[index]
+
+    def __setitem__(self, index: int, value: TecplotZone) -> None:
+        if not isinstance(value, TecplotZone):
+            raise TypeError("Value must be a TecplotZone instance.")
+
+        self._validateZone(value.zoneType)
+
+        if index < 0 or index >= len(self.zones):
+            raise IndexError("Zone index out of range.")
+
+        self.zones[index] = value
+
+    def __iter__(self):
+        """Iterate over the zones in the Tecplot data."""
+        for zone in self.zones:
+            yield zone
+
+    def _validateAllZones(self) -> None:
+        """Validate that all the current zones have the same type."""
+        if not self.zones:
+            # No zones to validate against, so we can accept any zone type
+            return
+
+        # Check if all zones have the same zone type
+        if not all(z.zoneType == self.zones[0].zoneType for z in self.zones[1:]):
+            raise TypeError("All zones must have the same zone type.")
+
+    @staticmethod
+    def _getVariableIndices(variables: List[str], variableNames: List[str]) -> List[int]:
+        """Get the indices of the variables in the variableNames list."""
+        variableIndices = []
+        for var in variables:
+            if var not in variableNames:
+                raise ValueError(f"Variable '{var}' not found in the variable names.")
+            variableIndices.append(variableNames.index(var))
+        return variableIndices
+
+    def _convertSharedVariablesToIndices(self, zone: TecplotZone) -> None:
+        if zone.sharedVariables:
+            # Convert shared variables from strings to indices
+            sharedVars = {}
+            for zoneIdx, variables in zone.sharedVariables.items():
+                sharedVars[zoneIdx] = self._getVariableIndices(variables, self.variables)
+            zone.sharedVariables = sharedVars
+
+    def _convertSharedVariablesToIndicesAllZones(self) -> None:
+        for zone in self.zones:
+            self._convertSharedVariablesToIndices(zone)
+
+    def _validateZone(self, zone: TecplotZone) -> None:
+        """Validate that the zone type is one of the supported types."""
+        if not self.zones:
+            # No zones to validate against, so we can accept any zone type
+            return
+
+        if zone.zoneType != self.zones[0].zoneType:
+            raise TypeError(
+                f"Zone type {zone.zoneType.name} does not match the existing zone type {self.zones[0].zoneType.name}."
+            )
+
+    def _validateSharedZoneVariables(self) -> None:
+        """Validate shared variables for all zones."""
+        for zone in self.zones:
+            if not zone.sharedVariables:
+                continue
+
+            if zone.zoneType in FEZones:
+                validZones = [z for z in self.zones if z.zoneType in FEZones]
+                errorMsg = "Finite element zones can only share data with other finite element zones."
+            elif zone.zoneType == ZoneType.ORDERED:
+                validZones = [z for z in self.zones if z.zoneType == ZoneType.ORDERED]
+                errorMsg = "Ordered zones can only share data with other ordered zones."
+            else:
+                raise TypeError(f"Zone type {zone.zoneType.name} does not support shared variables.")
+
+            if not validZones:
+                raise TypeError(f"No valid zones found to use shared variables with Zone: {zone.title}. {errorMsg}")
+
+            sharedZones: list[TecplotZone] = [self.zones[i] for i in zone.sharedVariables.keys()]
+            sharedVars = list(zone.sharedVariables.values())
+            localVars = set(range(len(self.variables))) - set(sharedVars)
+            localShape = zone.data.shape
+
+            if len(localVars) != localShape[-1]:
+                raise ValueError(
+                    f"Zone {zone.title} has {len(localVars)} local variables, "
+                    f"but the data shape is {localShape}. "
+                    "The number of local variables must match the last dimension of the data."
+                )
+
+            for sharedZone in sharedZones:
+                if sharedZone not in validZones:
+                    raise TypeError(
+                        f"Zone type {zone.zoneType.name} does not support shared variables with incompatible zones."
+                    )
+                if sharedZone.data.shape[:-1] != localShape[:-1]:
+                    raise ValueError(
+                        f"Zone {zone.title} has a shape of {localShape}, "
+                        f"but shared zone {sharedZone.title} has a shape of {sharedZone.data.shape}. "
+                        "The leading dimensions must match for shared variables."
+                    )
+
+            totalVars = len(localVars) + len(sharedVars)
+            if totalVars != len(self.variables):
+                raise ValueError(
+                    f"Zone {zone.title} has {totalVars} total variables (local + shared), "
+                    f"but the total number of variables is {len(self.variables)}. "
+                    "The total number of variables must match the number of variables in the Tecplot data."
+                )
+
+    def addZone(self, zone: TecplotZone) -> None:
+        if not isinstance(zone, TecplotZone):
+            raise TypeError("zone must be an instance of TecplotZone.")
+
+        self._validateZone(zone)
+        self._convertSharedVariablesToIndices(zone)
+
+        self.zones.append(zone)
+
+    def addZones(self, zones: List[TecplotZone]) -> None:
+        for zone in zones:
+            if not isinstance(zone, TecplotZone):
+                raise TypeError("All items must be instances of TecplotZone.")
+            self._validateZone(zone)
+            self._convertSharedVariablesToIndices(zone)
+
+            self.zones.append(zone)
+
+    def getZoneDataDict(self, index: int) -> Dict[str, npt.NDArray]:
+        zone = self.zones[index]
+        data = {}
+
+        # We need to figure out what data this zone contains and what data it shares with other zones
+        sharedVariables = set()
+        sharedData = {}
+
+        if zone.sharedVariables:
+            for zoneIdx, varIdxs in zone.sharedVariables.items():
+                zoneData = self.zones[zoneIdx].data
+                sharedVariables.add(varIdxs)
+                for vi in varIdxs:
+                    sharedData[vi] = zoneData[..., vi]  # Last dimension is the variable index
+
+        # Get the variables that are unique to this zone
+        uniqueVariables = set(range(len(self.variables))) - sharedVariables
+        uniqueVariablesSorted = sorted(list(uniqueVariables))
+
+        # Create a dictionary of the data local to this zone
+        localData = {variableIdx: zone.data[..., variableIdx] for variableIdx in uniqueVariablesSorted}
+
+        # Combine local and shared data
+        data.update(localData)
+        data.update(sharedData)
+
+        # Sort the data dictionary by variable index
+        data = {self.variables[k]: data[k] for k in sorted(data.keys())}
+
+        return data
+
+    def getZoneDataArray(self, index: int) -> npt.NDArray:
+        zone = self.zones[index]
+        data = {}
+
+        # We need to figure out what data this zone contains and what data it shares with other zones
+        sharedVariables = set()
+        sharedData = {}
+
+        if zone.sharedVariables:
+            for zoneIdx, varIdxs in zone.sharedVariables.items():
+                zoneData = self.zones[zoneIdx].data
+                sharedVariables.add(varIdxs)
+                for vi in varIdxs:
+                    sharedData[vi] = zoneData[..., vi]  # Last dimension is the variable index
+
+        # Get the variables that are unique to this zone
+        uniqueVariables = set(range(len(self.variables))) - sharedVariables
+        uniqueVariablesSorted = sorted(list(uniqueVariables))
+
+        # Create a dictionary of the data local to this zone
+        localData = {variableIdx: zone.data[..., variableIdx] for variableIdx in uniqueVariablesSorted}
+
+        # Combine local and shared data
+        data.update(localData)
+        data.update(sharedData)
+
+        # Create a numpy array of the data
+        dataArray = np.stack([data[ivar] for ivar in range(len(self.variables))], axis=-1)
+
+        return dataArray
+
+    def getZoneHeader(self, index: int) -> Dict[str, Any]:
+        zone = self.zones[index]
+        return {
+            "title": zone.title,
+            "zoneType": zone.zoneType,
+            "sharedVariables": zone.sharedVariables,
+            "dataType": zone.dataType,
+            "dataPacking": zone.dataPacking,
+            "varLocation": zone.varLocation,
+            "strandID": zone.strandID,
+            "solutionTime": zone.solutionTime,
+            "passiveVariables": zone.passiveVariables,
+            "auxData": zone.auxData,
+        }
+
+    def getZoneTitle(self, index: int) -> str:
+        return self.zones[index].title
+
+    def getVariableAllZones(self, variable: str) -> List[npt.NDArray]:
+        assert variable in self.variables, f"Variable '{variable}' not found in Tecplot data."
+        varData = []
+        for i in range(len(self.zones)):
+            data = self.getZoneData(i)
+            varData.append(data[variable])  # Get the variable data for each zone
+
+        return varData
+
+    def getVariableZone(self, variable: str, index: int) -> npt.NDArray:
+        assert variable in self.variables, f"Variable '{variable}' not found in Tecplot data."
+        data = self.getZoneData(index)
+        return data[variable]
+
+    def getConnectivityZone(self, index: int) -> npt.NDArray:
+        return self.zones[index].connectivity
+
+    def getUniqueConnectivityZone(self, index: int) -> npt.NDArray:
+        return self.zones[index].uniqueConnectivity
+
+    def getTriConnectivityZone(self, index: int) -> npt.NDArray:
+        return self.zones[index].triConnectivity
 
 
 # ==============================================================================
@@ -451,25 +574,27 @@ def writeArrayToFile(
     if arr.ndim != 2:
         raise ValueError("Input must be a 2D numpy array")
 
-    for row in arr:
-        rowStr = np.array2string(
-            row,
-            max_line_width=maxLineWidth,
-            separator=separator.value,
-            formatter={"float_kind": lambda x: f"{x:.{precision}E}"},
-            threshold=np.inf,
-        )
-        cleanedRowStr = rowStr.strip("[]").strip().replace("\n ", "\n")  # Remove brackets and extra spaces
-        handle.write(cleanedRowStr + "\n")
+    kwargs = {
+        "max_line_width": maxLineWidth,
+        "separator": separator.value,
+        "formatter": {"float_kind": lambda x: f"{x:.{precision}E}"},
+        "threshold": np.inf,
+    }
+
+    def array2stringClean(val: npt.NDArray) -> str:
+        """Clean the output of np.array2string to remove extra spaces."""
+        return np.array2string(val, **kwargs).strip("[]").strip().replace("\n ", "\n")
+
+    rows = [array2stringClean(row) for row in arr]
+    handle.writelines(rows)
 
 
-class TecplotZoneWriterASCII(Generic[T], ABC):
+class TecplotZoneWriterASCII:
     def __init__(
         self,
-        zone: T,
-        datapacking: Literal["BLOCK", "POINT"],
-        precision: Literal["SINGLE", "DOUBLE"],
+        zone: Optional[TecplotZone] = None,
         separator: Separator = Separator.SPACE,
+        maxLineWidth: int = 32000,
     ) -> None:
         """Abstract base class for writing Tecplot zones to ASCII files.
 
@@ -484,178 +609,132 @@ class TecplotZoneWriterASCII(Generic[T], ABC):
             The floating point precision to write the data.
         """
         self.zone = zone
-        self.datapacking = DataPacking[datapacking].name
-        self.fmtPrecision = DataPrecision[precision].value
         self.separator = separator
+        self.maxLineWidth = maxLineWidth
 
-    @abstractmethod
     def writeHeader(self, handle: TextIO):
-        pass
+        header = self.zone.header
 
-    @abstractmethod
+        headerList = [f'ZONE T="{header.TITLE}"']
+
+        # If we have an ordered zone type, write the dimensions
+        if header.ZONETYPE == ZoneType.ORDERED:
+            headerList += f"I={header.I}"
+
+            if header.J:
+                headerList += f"J={header.J}"
+
+            if header.K:
+                headerList += f"K={header.K}"
+
+        if header.ZONETYPE in FEZones:
+            headerList += f"NODES={header.NODES}"
+            headerList += f"ELEMENTS={header.ELEMENTS}"
+            headerList += f"ZONETYPE={header.ZONETYPE.name}"
+
+        # Write the strand ID and solution time
+        if header.STRANDID != StrandID.STATIC.value and header.STRANDID != StrandID.PENDING.value:
+            # ASCII format does not support the -1 or -2 strand IDs
+            # So we only write the strand ID if it is not -1
+            headerList += f"STRANDID={header.STRANDID}"
+
+        # Only write the solution time if it is set
+        if header.SOLUTIONTIME != SolutionTime.UNSET.value:
+            headerList += f"SOLUTIONTIME={header.SOLUTIONTIME}"
+
+        # Write the datapacking
+        headerList += f"DATAPACKING={header.DATAPACKING.value}\n"
+
+        # Write all remaining metadata if not None
+        if header.TOTALNUMFACENODES:
+            headerList += f"TOTALNUMFACENODES={header.TOTALNUMFACENODES}"
+
+        if header.NUMCONNECTEDBOUNDARYFACES:
+            headerList += f"NUMCONNECTEDBOUNDARYFACES={header.NUMCONNECTEDBOUNDARYFACES}"
+
+        if header.TOTALNUMBOUNDARYCONNECTIONS:
+            headerList += f"TOTALNUMBOUNDARYCONNECTIONS={header.TOTALNUMBOUNDARYCONNECTIONS}"
+
+        if header.FACENEIGHBORMODE:
+            headerList += f"FACENEIGHBORMODE={header.FACENEIGHBORMODE.value}"
+
+        if header.FACENEIGHBORCONNECTIONS:
+            headerList += f"FACENEIGHBORCONNECTIONS={header.FACENEIGHBORCONNECTIONS}"
+
+        if header.DT:
+            headerList += f"DT={header.DT.name}"
+
+        if header.VARLOCATION:
+            headerList += f"VARLOCATION={header.VARLOCATION.value}"
+
+        if header.VARSHARELIST:
+            headerList += f"VARSHARELIST={','.join(header.VARSHARELIST)}"
+
+        if header.NV:
+            headerList += f"NV={header.NV}"
+
+        if header.CONNECTIVITYSHAREZONE:
+            headerList += f"CONNECTIVITYSHAREZONE={header.CONNECTIVITYSHAREZONE}"
+
+        if header.PASSIVEVARLIST:
+            headerList += f"PASSIVEVARLIST={','.join(header.PASSIVEVARLIST)}"
+
+        if header.AUXDATA:
+            for key, value in header.AUXDATA.items():
+                headerList += f"AUXDATA {key}={value}"
+
+        # Join the header into a single string with a line break every 5 elements
+        chunks = [headerList[i : i + 5] for i in range(0, len(headerList), 5)]
+        headerString = "\n".join([", ".join(chunk) for chunk in chunks])
+
+        # Write the header and newline to the file
+        handle.write(headerString)
+        handle.write("\n")
+
     def writeFooter(self, handle: TextIO):
-        pass
+        # Only write a footer if there is connectivity data and the zone is FE
+        if self.zone.header.ZONETYPE not in FEZones:
+            handle.write("\n")
+        else:
+            if self.zone.connectivity.size > 0:
+                connectivity = self.zone.connectivity + 1
+                # Get the max characters in the connectivity
+                maxChars = len(str(connectivity.max()))
+
+                np.savetxt(handle, connectivity, fmt=f"%{maxChars}d")
+
+                handle.write("\n")
 
     def writeData(self, handle: TextIO):
-        data = np.stack([self.zone.data[var] for var in self.zone.variables], axis=-1)
+        data = np.stack([self.zone.data[var] for var in self.zone.data.keys()], axis=-1)
 
-        if self.datapacking == "POINT":
-            data = data.reshape(-1, len(self.zone.variables))
+        if self.zone.header.DATAPACKING == DataPacking.POINT:
+            data = data.reshape(-1, len(self.zone.data.keys()))
         else:
-            data = data.reshape(-1, len(self.zone.variables)).T
+            data = data.reshape(-1, len(self.zone.data.keys())).T
 
-        writeArrayToFile(data, handle, maxLineWidth=4000, precision=self.fmtPrecision, separator=self.separator)
+        precision = DataPrecision[self.zone.header.DT.name].value
+        writeArrayToFile(data, handle, maxLineWidth=self.maxLineWidth, precision=precision, separator=self.separator)
 
 
-class TecplotOrderedZoneWriterASCII(TecplotZoneWriterASCII[TecplotOrderedZone]):
+class TecplotWriter(ABC):
+    def __init__(self, tecplotData: TecplotData):
+        self.tecplotData = tecplotData
+
+    @abstractmethod
+    def write(self, filename: Union[str, Path]) -> None:
+        pass
+
+    @abstractmethod
+    def _writeZone(self, handle: TextIO, zone: TecplotZone) -> None:
+        pass
+
+
+class TecplotWriterASCII(TecplotWriter):
     def __init__(
         self,
-        zone: TecplotOrderedZone,
-        datapacking: Literal["BLOCK", "POINT"],
-        precision: Literal["SINGLE", "DOUBLE"],
-        separator: Separator = Separator.SPACE,
-    ) -> None:
-        """Writer for Tecplot ordered zones in ASCII format.
-
-        Parameters
-        ----------
-        zone : TecplotOrderedZone
-            The ordered zone to write.
-        datapacking : Literal["BLOCK", "POINT"]
-            The data packing format. BLOCK is row-major, POINT is
-            column-major.
-        precision : Literal["SINGLE", "DOUBLE"]
-            The floating point precision to write the data.
-        separator : Separator, optional
-            Separator to use between elements. The Separator
-            is an enum defined in :meth:`Separator <baseclasses.utils.tecplotIO.Separator>`,
-            by default Separator.SPACE
-        """
-        super().__init__(zone, datapacking, precision, separator)
-
-    def writeHeader(self, handle: TextIO):
-        """Write the zone header to the file.
-
-        Parameters
-        ----------
-        handle : TextIO
-            The file handle.
-        """
-        # Write the zone header
-        zoneString = f'ZONE T="{self.zone.name}"'
-        zoneString += f", I={self.zone.iMax}"
-
-        if self.zone.jMax > 1:
-            zoneString += f", J={self.zone.jMax}"
-
-        if self.zone.kMax > 1:
-            zoneString += f", K={self.zone.kMax}"
-
-        # Write the strand ID and solution time
-        if self.zone.strandID != StrandID.STATIC.value and self.zone.strandID != StrandID.PENDING.value:
-            # ASCII format does not support the -1 or -2 strand IDs
-            # So we only write the strand ID if it is not -1
-            zoneString += f", STRANDID={self.zone.strandID}"
-
-        # Only write the solution time if it is set
-        if self.zone.solutionTime != SolutionTime.UNSET.value:
-            zoneString += f", SOLUTIONTIME={self.zone.solutionTime}"
-
-        zoneString += f", DATAPACKING={self.datapacking}\n"
-
-        handle.write(zoneString)
-
-    def writeFooter(self, handle: TextIO):
-        """Write the zone footer to the file.
-
-        Parameters
-        ----------
-        handle : TextIO
-            The file handle.
-        """
-        handle.write("\n")
-
-
-class TecplotFEZoneWriterASCII(TecplotZoneWriterASCII[TecplotFEZone]):
-    def __init__(
-        self,
-        zone: TecplotFEZone,
-        datapacking: Literal["BLOCK", "POINT"],
-        precision: Literal["SINGLE", "DOUBLE"],
-        separator: Separator = Separator.SPACE,
-    ) -> None:
-        """Writer for Tecplot finite element zones in ASCII format.
-
-        Parameters
-        ----------
-        zone : TecplotFEZone
-            The finite element zone to write.
-        datapacking : Literal["BLOCK", "POINT"]
-            The data packing format. BLOCK is row-major, POINT is
-            column-major.
-        precision : Literal["SINGLE", "DOUBLE"]
-            The floating point precision to write the data.
-        separator : Separator, optional
-            Separator to use between elements. The Separator is an enum
-            defined in :meth:`Separator <baseclasses.utils.tecplotIO.Separator>`,
-            by default Separator.SPACE
-        """
-        super().__init__(zone, datapacking, precision, separator)
-
-    def writeHeader(self, handle: TextIO):
-        """Write the zone header to the file.
-
-        Parameters
-        ----------
-        handle : TextIO
-            The file handle.
-        """
-        # Write the zone header
-        zoneString = f'ZONE T="{self.zone.name}"'
-        zoneString += f", DATAPACKING={self.datapacking}"
-
-        # Write the node and element information
-        zoneString += f", NODES={np.multiply.reduce(self.zone.shape):d}"
-        zoneString += f", ELEMENTS={self.zone.nElements:d}"
-        zoneString += f", ZONETYPE={self.zone.zoneType.name}"
-
-        # Write the strand ID and solution time
-        if self.zone.strandID != StrandID.STATIC.value and self.zone.strandID != StrandID.PENDING.value:
-            # ASCII format does not support the -1 or -2 strand IDs
-            # So we only write the strand ID if it is not -1
-            zoneString += f", STRANDID={self.zone.strandID}"
-
-        # Only write the solution time if it is set
-        if self.zone.solutionTime != SolutionTime.UNSET.value:
-            zoneString += f", SOLUTIONTIME={self.zone.solutionTime}\n"
-
-        handle.write(zoneString)
-
-    def writeFooter(self, handle: TextIO):
-        """Write the zone footer to the file. This includes the
-        connectivity information.
-
-        Parameters
-        ----------
-        handle : TextIO
-            The file handle.
-        """
-        connectivity = self.zone.connectivity + 1
-        # Get the max characters in the connectivity
-        maxChars = len(str(connectivity.max()))
-
-        np.savetxt(handle, connectivity, fmt=f"%{maxChars}d")
-
-        handle.write("\n")
-
-
-class TecplotWriterASCII:
-    def __init__(
-        self,
-        title: str,
-        zones: List[TecplotZone],
-        datapacking: Literal["BLOCK", "POINT"],
-        precision: Literal["SINGLE", "DOUBLE"],
+        tecplotData: TecplotData,
+        maxLineWidth: int = 32000,
         separator: Separator = Separator.SPACE,
     ) -> None:
         """Writer for Tecplot files in ASCII format.
@@ -676,17 +755,9 @@ class TecplotWriterASCII:
             is an enum defined in :meth:`Separator <baseclasses.utils.tecplotIO.Separator>`,
             by default Separator.SPACE
         """
-        self.title = title
-        self.zones = zones
-        self.datapacking = DataPacking[datapacking].name
-        self.precision = DataPrecision[precision].name
+        super().__init__(tecplotData)
+        self.maxLineWidth = maxLineWidth
         self.separator = separator
-        self._validateVariables()
-
-    def _validateVariables(self) -> None:
-        """Check that all zones have the same variables."""
-        if not all(set(self.zones[0].variables) == set(zone.variables) for zone in self.zones):
-            raise ValueError("All zones must have the same variables.")
 
     def _writeVariables(self, handle: TextIO) -> None:
         """Write the variable names to the file.
@@ -696,9 +767,13 @@ class TecplotWriterASCII:
         handle : TextIO
             The file handle.
         """
-        variables = [f'"{var}"' for var in self.zones[0].variables]
-        variableString = ", ".join(variables)
-        handle.write(f"VARIABLES = {variableString}\n")
+        variables = [f'"{var}"' for var in self.tecplotData.variables]  # Wrap variable names in quotes
+        variableString = ", ".join(variables)  # Join the variables into a single string
+        handle.write(f"VARIABLES = {variableString}")
+        handle.write("\n")
+
+    def _writeHeader(self, handle: TextIO, zone: TecplotZone) -> None:
+        pass
 
     def _writeZone(self, handle: TextIO, zone: TecplotZone) -> None:
         """Write a Tecplot zone to the file.
@@ -715,16 +790,10 @@ class TecplotWriterASCII:
         ValueError
             If the zone type is invalid.
         """
-        if isinstance(zone, TecplotOrderedZone):
-            writer = TecplotOrderedZoneWriterASCII(zone, self.datapacking, self.precision, self.separator)
-        elif isinstance(zone, TecplotFEZone):
-            writer = TecplotFEZoneWriterASCII(zone, self.datapacking, self.precision, self.separator)
-        else:
-            raise ValueError("Invalid zone type.")
-
-        writer.writeHeader(handle)
-        writer.writeData(handle)
-        writer.writeFooter(handle)
+        self._zoneWriter.zone = zone
+        self._zoneWriter.writeHeader(handle)
+        self._zoneWriter.writeData(handle)
+        self._zoneWriter.writeFooter(handle)
 
     def write(self, filename: Union[str, Path]) -> None:
         """Write the Tecplot file to disk.
@@ -735,9 +804,9 @@ class TecplotWriterASCII:
             The filename as a string or pathlib.Path object.
         """
         with open(filename, "w") as handle:
-            handle.write(f'TITLE = "{self.title}"\n')
+            handle.write(f'TITLE = "{self.tecplotData.title}"\n')
             self._writeVariables(handle)
-            for zone in self.zones:
+            for zone in self.tecplotData.zones:
                 self._writeZone(handle, zone)
 
 
@@ -800,13 +869,8 @@ def _writeString(handle: TextIO, value: str) -> None:
     handle.write(struct.pack("i", 0))
 
 
-class TecplotZoneWriterBinary(Generic[T], ABC):
-    def __init__(
-        self,
-        title: str,
-        zone: T,
-        precision: Literal["SINGLE", "DOUBLE"],
-    ) -> None:
+class TecplotZoneWriterBinary:
+    def __init__(self, zone: Optional[TecplotZone] = None) -> None:
         """Abstract base class for writing Tecplot zones to binary
         files.
 
@@ -819,12 +883,9 @@ class TecplotZoneWriterBinary(Generic[T], ABC):
         precision : Literal["SINGLE", "DOUBLE"]
             The floating point precision to write the data.
         """
-        self.title = title
         self.zone = zone
-        self.datapacking = "BLOCK"
-        self.precision = DataPrecision[precision].name
 
-    def _writeCommonHeader(self, handle: TextIO) -> None:
+    def writeHeader(self, handle: TextIO) -> None:
         """Write the common header information for all zones.
 
         Parameters
@@ -832,21 +893,40 @@ class TecplotZoneWriterBinary(Generic[T], ABC):
         handle : TextIO
             The file handle.
         """
+        if self.zone is None:
+            raise ValueError("Zone object must be set.")
+
+        header = self.zone.header
+
         # Write the zone marker
         _writeFloat32(handle, SectionMarkers.ZONE.value)  # Write the zone marker
-        _writeString(handle, self.zone.name)  # Write the zone name
+        _writeString(handle, header.TITLE)  # Write the zone name
         _writeInteger(handle, BinaryFlags.NONE.value)  # Write the parent zone
-        _writeInteger(handle, self.zone.strandID)  # Write the strand ID
-        _writeFloat64(handle, self.zone.solutionTime)  # Write the solution time
+        _writeInteger(handle, header.STRANDID)  # Write the strand ID
+        _writeFloat64(handle, header.SOLUTIONTIME)  # Write the solution time
         _writeInteger(handle, BinaryFlags.NONE.value)  # Write the default color
-        _writeInteger(handle, self.zone.zoneType.value)  # Write the zone type
+        _writeInteger(handle, header.ZONETYPE.value)  # Write the zone type
         _writeInteger(handle, DataPacking.BLOCK.value)  # Data Packing (Always block for binary)
-        _writeInteger(handle, VariableLocation.NODE.value)  # Specify the variable location
+        _writeInteger(handle, header.VARLOCATION.value)  # Specify the variable location
         _writeInteger(handle, BinaryFlags.FALSE.value)  # Are raw 1-1 face neighbors supplied
 
-    @abstractmethod
-    def writeHeader(self, handle: TextIO):
-        pass
+        # Ordered zone header data
+        if header.ZONETYPE == ZoneType.ORDERED:
+            _writeInteger(handle, header.I)  # Write the I dimension
+            _writeInteger(handle, header.J)  # Write the J dimension
+            _writeInteger(handle, header.K)  # Write the K dimension
+
+        # FE zone header data
+        if header.ZONETYPE in FEZones:
+            _writeInteger(handle, header.NODES)  # Write the number of nodes
+            _writeInteger(handle, header.ELEMENTS)  # Write the number of elements
+            _writeInteger(handle, 0)  # iCellDim (future use, set to 0)
+            _writeInteger(handle, 0)  # jCellDim (future use, set to 0)
+            _writeInteger(handle, 0)  # kCellDim (future use, set to 0)
+
+        # Does the zone have aux data
+        if header.AUXDATA:
+            pass
 
     def writeData(self, handle: TextIO):
         """Write the zone data to the file.
@@ -878,118 +958,15 @@ class TecplotZoneWriterBinary(Generic[T], ABC):
             _writeFloat64(handle, data[i, ...].max())
 
         # Write the data using the specified data format (single or double)
-        data.astype(DTypePrecision[self.precision].value).tofile(handle)
-
-    @abstractmethod
-    def writeFooter(self, handle: TextIO):
-        pass
-
-
-class TecplotOrderedZoneWriterBinary(TecplotZoneWriterBinary[TecplotOrderedZone]):
-    def __init__(
-        self,
-        title: str,
-        zone: TecplotOrderedZone,
-        precision: Literal["SINGLE", "DOUBLE"],
-    ) -> None:
-        """Writer for Tecplot ordered zones in binary format.
-
-        Parameters
-        ----------
-        title : str
-            The title of the Tecplot file.
-        zone : TecplotOrderedZone
-            The ordered zone to write.
-        precision : Literal["SINGLE", "DOUBLE"]
-            The floating point precision to write the data.
-        """
-        super().__init__(title, zone, precision)
-
-    def writeHeader(self, handle: TextIO):
-        """Write the zone header to the file.
-
-        Parameters
-        ----------
-        handle : TextIO
-            The file handle.
-        """
-        self._writeCommonHeader(handle)  # Write the common header information
-
-        # --- Specific to Ordered Zones ---
-        _writeInteger(handle, self.zone.iMax)  # Write the I dimension
-        _writeInteger(handle, self.zone.jMax)  # Write the J dimension
-        _writeInteger(handle, self.zone.kMax)  # Write the K dimension
-        _writeInteger(handle, BinaryFlags.FALSE.value)  # No aux data
+        data.astype(DataType[self.zone.header.DT].value).tofile(handle)
 
     def writeFooter(self, handle: TextIO):
-        """Write the zone footer to the file. This is not used for
-        ordered zones.
-
-        Parameters
-        ----------
-        handle : TextIO
-            The file handle.
-        """
-        pass
+        if self.zone.header.ZONETYPE in FEZones:
+            self.zone.connectivity.astype("int32").tofile(handle)
 
 
-class TecplotFEZoneWriterBinary(TecplotZoneWriterBinary[TecplotFEZone]):
-    def __init__(
-        self,
-        title: str,
-        zone: TecplotFEZone,
-        precision: Literal["SINGLE", "DOUBLE"],
-    ) -> None:
-        """Writer for Tecplot finite element zones in binary format.
-
-        Parameters
-        ----------
-        title : str
-            The title of the Tecplot file.
-        zone : TecplotFEZone
-            The finite element zone to write.
-        precision : Literal["SINGLE", "DOUBLE"]
-            The floating point precision to write the data.
-        """
-        super().__init__(title, zone, precision)
-
-    def writeHeader(self, handle: TextIO):
-        """Write the zone header to the file.
-
-        Parameters
-        ----------
-        handle : TextIO
-            The file handle.
-        """
-        self._writeCommonHeader(handle)  # Write the common header information
-
-        # --- Specific to FE Zones ---
-        _writeInteger(handle, self.zone.nNodes)  # Write the number of nodes
-        _writeInteger(handle, self.zone.nElements)  # Write the number of elements
-        _writeInteger(handle, 0)  # iCellDim (future use, set to 0)
-        _writeInteger(handle, 0)  # jCellDim (future use, set to 0)
-        _writeInteger(handle, 0)  # kCellDim (future use, set to 0)
-        _writeInteger(handle, BinaryFlags.FALSE.value)  # No aux data
-
-    def writeFooter(self, handle: TextIO):
-        """Write the zone footer to the file. This includes the
-        connectivity information.
-
-        Parameters
-        ----------
-        handle : TextIO
-            The file handle.
-        """
-        self.zone.connectivity.astype("int32").tofile(handle)
-
-
-class TecplotWriterBinary:
-    def __init__(
-        self,
-        title: str,
-        zones: List[TecplotZone],
-        precision: Literal["SINGLE", "DOUBLE"],
-    ) -> None:
+class TecplotWriterBinary(TecplotWriter):
+    def __init__(self, tecplotData: TecplotData) -> None:
         """Writer for Tecplot files in binary format.
 
         This writer only supports files formatted using the format
@@ -1007,41 +984,9 @@ class TecplotWriterBinary:
         precision : Literal["SINGLE", "DOUBLE"]
             The floating point precision to write the data.
         """
-        self._magicNumber = b"#!TDV112"
-        self.title = title
-        self.zones = zones
-        self.precision = precision
-        self._checkVariables()
-
-    def _checkVariables(self) -> None:
-        """Check that all zones have the same variables."""
-        if not all(set(self.zones[0].variables) == set(zone.variables) for zone in self.zones):
-            raise ValueError("All zones must have the same variables.")
-
-    def _getZoneWriter(self, zone: TecplotZone) -> TecplotZoneWriterBinary:
-        """Get the appropriate zone writer based on the zone type.
-
-        Parameters
-        ----------
-        zone : TecplotZone
-            The Tecplot zone to write.
-
-        Returns
-        -------
-        TecplotZoneWriterBinary
-            The appropriate zone writer object.
-
-        Raises
-        ------
-        ValueError
-            If the zone type is invalid.
-        """
-        if isinstance(zone, TecplotOrderedZone):
-            return TecplotOrderedZoneWriterBinary(self.title, zone, self.precision)
-        elif isinstance(zone, TecplotFEZone):
-            return TecplotFEZoneWriterBinary(self.title, zone, self.precision)
-        else:
-            raise ValueError("Invalid zone type.")
+        super().__init__(tecplotData)
+        self._magicNumber = b"#!TDV112"  # Magic number for Tecplot binary files
+        self._zoneWriter = TecplotZoneWriterBinary()
 
     def write(self, filename: Union[str, Path]) -> None:
         """Write the Tecplot file to disk.
@@ -1052,28 +997,29 @@ class TecplotWriterBinary:
             The filename as a string or pathlib.Path object.
         """
         with open(filename, "wb") as handle:
+            # Write the header information
             handle.write(self._magicNumber)  # Magic number
             _writeInteger(handle, 1)  # Byte order
-            _writeInteger(handle, FileType.FULL.value)  # Full filetype
-            _writeString(handle, self.title)  # Write the title
-            _writeInteger(handle, len(self.zones[0].variables))  # Write the number of variables
+            _writeInteger(handle, self.tecplotData.filetype.value)  # Full filetype
+            _writeString(handle, self.tecplotData.title)  # Write the title
+            _writeInteger(handle, len(self.tecplotData.variables))  # Write the number of variables
 
-            for var in self.zones[0].variables:
+            for var in self.tecplotData.variables:
                 _writeString(handle, var)  # Write the variable names
 
             # Write the zone headers
-            for zone in self.zones:
-                writer = self._getZoneWriter(zone)
-                writer.writeHeader(handle)
+            for zone in self.tecplotData.zones:
+                self._zoneWriter.zone = zone
+                self._zoneWriter.writeHeader(handle)
 
             # Write the data marker
             _writeFloat32(handle, SectionMarkers.DATA.value)
 
             # Write the data and footer for each zone
-            for zone in self.zones:
-                writer = self._getZoneWriter(zone)
-                writer.writeData(handle)
-                writer.writeFooter(handle)
+            for zone in self.tecplotData.zones:
+                self._zoneWriter.zone = zone
+                self._zoneWriter.writeData(handle)
+                self._zoneWriter.writeFooter(handle)
 
 
 # ==============================================================================
@@ -1133,69 +1079,68 @@ class TecplotASCIIReader:
 
         Parameters
         ----------
-        line : str
-            The line containing the zone header information.
+        lines : List[str]
+            The list of lines in the file.
+        iCurrent : int
+            The current line number in the file.
 
         Returns
         -------
         Dict[str, Any]
             A dictionary containing the parsed zone header information.
         """
-        # Get all the header lines into a single string
-        header = []
-
-        # Loop until the line starts with a number which denotes the start of the data section
+        # Collect the header lines
         exitPattern = re.compile(r"^\s*\d")
+        headerFlag = False
+        headerLines = []
         while not exitPattern.match(lines[iCurrent]):
-            header.append(lines[iCurrent].strip("\n"))
+            line = lines[iCurrent]
+
+            if line.lower().startswith("zone"):
+                # This line starts the zone record
+                headerFlag = True
+
+                # Remove zone from the start of the line case-insensitive
+                line = re.sub(r"^zone", "", line, flags=re.IGNORECASE)
+
+            if headerFlag:
+                headerLines.append(line)
+
             iCurrent += 1
 
         # Join the header lines into a single string
-        headerString = ", ".join(header)
+        headerString = "".join(headerLines)
 
-        # Use regex to parse the header information
-        zoneNameMatch = re.search(r'(zone t)\s*=\s*[\'""]?([^\'""\n,]+)[\'""]?(?=[,\n]|$)', headerString, re.IGNORECASE)
-        zoneName = zoneNameMatch.group(2) if zoneNameMatch else None
+        # Replace newlines with commas
+        headerString = headerString.replace("\n", ",")
 
-        zoneTypeMatch = re.search(r"zonetype\s*=\s*(\w+)", headerString, re.IGNORECASE)
-        zoneType = zoneTypeMatch.group(1) if zoneTypeMatch else "ORDERED"
+        # Remove trailing comma
+        headerString = headerString.rstrip(",")
 
-        datapackingMatch = re.search(r"datapacking\s*=\s*(\w+)", headerString, re.IGNORECASE)
-        datapacking = datapackingMatch.group(1) if datapackingMatch else None
+        # Split the header by commas unless the comma is inside quotes
+        headerList = re.split(r",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)", headerString)
 
-        nNodesMatch = re.search(r"nodes\s*=\s*(\d+)", headerString, re.IGNORECASE)
-        nNodes = int(nNodesMatch.group(1)) if nNodesMatch else None
+        # Create a dictionary by splitting keys and values by equal signs
+        headerDictRaw = {key.strip().upper(): value.strip() for key, value in [item.split("=") for item in headerList]}
 
-        nElementsMatch = re.search(r"elements\s*=\s*(\d+)", headerString, re.IGNORECASE)
-        nElements = int(nElementsMatch.group(1)) if nElementsMatch else None
+        # Remove mirrored quotes from the values, but keep quotes if they are not mirrored
+        headerDict = {key: value.strip('"') for key, value in headerDictRaw.items()}
 
-        iMaxMatch = re.search(r"i\s*=\s*(\d+)", headerString, re.IGNORECASE)
-        iMax = int(iMaxMatch.group(1)) if iMaxMatch else 1
+        # If the keys in the headerDict match the zoneHeaders, convert the values to the enum value type
+        for key, value in headerDict.items():
+            if "AUXDATA" in key:
+                headerDict[key] = str(value)
+                continue
 
-        jMaxMatch = re.search(r"j\s*=\s*(\d+)", headerString, re.IGNORECASE)
-        jMax = int(jMaxMatch.group(1)) if jMaxMatch else 1
+            try:
+                headerEnum = ZoneHeader[key.upper()]
+                if isinstance(headerEnum.value, EnumMeta):
+                    headerDict[key] = headerEnum.value[value.upper()]
+                else:
+                    headerDict[key] = headerEnum.value(value)
 
-        kMaxMatch = re.search(r"k\s*=\s*(\d+)", headerString, re.IGNORECASE)
-        kMax = int(kMaxMatch.group(1)) if kMaxMatch else 1
-
-        solutionTimeMatch = re.search(r"solutiontime\s*=\s*(\d+\.\d+)", headerString, re.IGNORECASE)
-        solutionTime = float(solutionTimeMatch.group(1)) if solutionTimeMatch else 0.0
-
-        strandIDMatch = re.search(r"strandid\s*=\s*(\d+)", headerString, re.IGNORECASE)
-        strandID = int(strandIDMatch.group(1)) if strandIDMatch else -1
-
-        headerDict = {
-            "zoneName": zoneName,
-            "zoneType": zoneType,
-            "datapacking": datapacking,
-            "nNodes": nNodes,
-            "nElements": nElements,
-            "iMax": iMax,
-            "jMax": jMax,
-            "kMax": kMax,
-            "solutionTime": solutionTime,
-            "strandID": strandID,
-        }
+            except KeyError:
+                raise ValueError(f"Invalid zone header: {key}")
 
         return headerDict, iCurrent
 
@@ -1218,13 +1163,13 @@ class TecplotASCIIReader:
         Tuple[TecplotOrderedZone, int]
             The ordered zone object and the number of lines read.
         """
-        iMax = zoneHeaderDict["iMax"]
-        jMax = zoneHeaderDict["jMax"]
-        kMax = zoneHeaderDict["kMax"]
+        iMax = zoneHeaderDict[ZoneHeader.I.name]
+        jMax = zoneHeaderDict[ZoneHeader.J.name]
+        kMax = zoneHeaderDict[ZoneHeader.K.name]
         nNodes = iMax * jMax * kMax
         shape = (iMax, jMax, kMax, len(variables))
 
-        if zoneHeaderDict["datapacking"] == "POINT":
+        if zoneHeaderDict[ZoneHeader.DATAPACKING.name] == DataPacking.POINT:
             # Point data is column-major
             nodalData, nodeOffset = readArrayData(self.filename, iCurrent, nNodes, len(variables))
             nodalData = nodalData.reshape(shape, order="C").squeeze()
@@ -1234,12 +1179,7 @@ class TecplotASCIIReader:
             nodalData = nodalData.reshape(shape, order="F").squeeze()
 
         data = {var: nodalData[..., i] for i, var in enumerate(variables)}
-        zone = TecplotOrderedZone(
-            zoneHeaderDict["zoneName"],
-            data,
-            solutionTime=zoneHeaderDict["solutionTime"],
-            strandID=zoneHeaderDict["strandID"],
-        )
+        zone = TecplotOrderedZone(data, zoneHeaderDict)
 
         return zone, nodeOffset
 
@@ -1262,10 +1202,10 @@ class TecplotASCIIReader:
         Tuple[TecplotFEZone, int]
             The finite element zone object and the number of lines read.
         """
-        nNodes = zoneHeaderDict["nNodes"]
-        nElements = zoneHeaderDict["nElements"]
+        nNodes = zoneHeaderDict[ZoneHeader.NODES.name]
+        nElements = zoneHeaderDict[ZoneHeader.ELEMENTS.name]
 
-        if zoneHeaderDict["datapacking"] == "POINT":
+        if zoneHeaderDict[ZoneHeader.DATAPACKING.name] == DataPacking.POINT:
             # Point data is column-major
             nodalData, nodeOffset = readArrayData(self.filename, iCurrent, nNodes, len(variables))
             nodalData = nodalData.reshape(nNodes, len(variables), order="C")
@@ -1284,14 +1224,7 @@ class TecplotASCIIReader:
             connectivity = connectivity.reshape(nElements, -1)
 
         data = {var: nodalData[..., i] for i, var in enumerate(variables)}
-        zone = TecplotFEZone(
-            zoneHeaderDict["zoneName"],
-            data,
-            connectivity - 1,
-            zoneType=zoneHeaderDict["zoneType"],
-            solutionTime=zoneHeaderDict["solutionTime"],
-            strandID=zoneHeaderDict["strandID"],
-        )
+        zone = TecplotFEZone(data, connectivity - 1, zoneHeaderDict)
 
         return zone, nodeOffset + nElements
 
@@ -1314,7 +1247,7 @@ class TecplotASCIIReader:
         """
         zoneHeaderDict, iLine = self._readZoneHeader(lines, iLine)
 
-        if zoneHeaderDict["zoneType"] == "ORDERED":
+        if zoneHeaderDict[ZoneHeader.ZONETYPE.name] == ZoneType.ORDERED:
             zone, iOffset = self._readOrderedZoneData(iLine, variables, zoneHeaderDict)
         else:
             zone, iOffset = self._readFEZoneData(iLine, variables, zoneHeaderDict)
@@ -1625,6 +1558,15 @@ class TecplotBinaryReader:
         datapacking = self._readInteger(handle)  # NOQA: F841
         variableLocation = self._readInteger(handle)  # NOQA: F841
         rawFaceNeighbors = self._readInteger(handle)  # NOQA: F841
+
+        headerDict = {
+            ZoneHeader.TITLE.name: zoneName,
+            ZoneHeader.STRANDID.name: strandID,
+            ZoneHeader.SOLUTIONTIME.name: solutionTime,
+            ZoneHeader.ZONETYPE.name: ZoneType(zoneType),
+            ZoneHeader.DATAPACKING.name: DataPacking(datapacking),
+            ZoneHeader.VARLOCATION.name: VariableLocation(variableLocation),
+        }
 
         if zoneType == ZoneType.ORDERED.value:
             zone = self._readOrderedZone(handle, zoneName, strandID, solutionTime)

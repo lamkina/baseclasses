@@ -9,7 +9,7 @@ import numpy as np
 import numpy.typing as npt
 from parameterized import parameterized
 
-from baseclasses.utils import TecplotFEZone, TecplotOrderedZone, readTecplot, writeTecplot
+from baseclasses.utils import readTecplot, writeTecplot, TecplotZone
 from baseclasses.utils.tecplotIO import Separator, ZoneType
 
 # --- Save tempfile locally or in a temp directory ---
@@ -320,29 +320,29 @@ class TestTecplotIO(unittest.TestCase):
             TecplotOrderedZone(123, {"X": X, "Y": Y, "Z": Z}, solutionTime=0.0, strandID=-1)
 
         msg = "Solution time must be a float"
-        with self.assertRaises(TypeError):
+        with self.assertRaises(TypeError, msg=msg):
             TecplotOrderedZone("Grid", {"X": X, "Y": Y, "Z": Z}, solutionTime="1.0", strandID=-1)
 
         msg = "Solution time must be greater than or equal to zero"
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError, msg=msg):
             TecplotOrderedZone("Grid", {"X": X, "Y": Y, "Z": Z}, solutionTime=-1.0, strandID=1)
 
         msg = "Strand ID must be an integer"
-        with self.assertRaises(TypeError):
+        with self.assertRaises(TypeError, msg=msg):
             TecplotOrderedZone("Grid", {"X": X, "Y": Y, "Z": Z}, solutionTime=0.0, strandID="1")
 
         msg = "Data values must be numpy arrays."
-        with self.assertRaises(TypeError):
+        with self.assertRaises(TypeError, msg=msg):
             TecplotOrderedZone(
                 "Grid", {"X": X.tolist(), "Y": Y.tolist(), "Z": Z.tolist()}, solutionTime=0.0, strandID=-1
             )
 
         msg = "Data must be a dictionary."
-        with self.assertRaises(TypeError):
+        with self.assertRaises(TypeError, msg=msg):
             TecplotOrderedZone("Grid", X, solutionTime=0.0, strandID=-1)
 
         msg = "All variables must have the same shape."
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError, msg=msg):
             TecplotOrderedZone("Grid", {"X": X, "Y": Y, "Z": Z[:-1]}, solutionTime=0.0, strandID=-1)
 
     def test_FEZone(self):
@@ -405,7 +405,7 @@ class TestTecplotIO(unittest.TestCase):
             )
 
         msg = "Solution time must be a float"
-        with self.assertRaises(TypeError):
+        with self.assertRaises(TypeError, msg=msg):
             TecplotFEZone(
                 "TetGrid",
                 {"X": nodes[:, 0], "Y": nodes[:, 1], "Z": nodes[:, 2]},
@@ -415,7 +415,7 @@ class TestTecplotIO(unittest.TestCase):
             )
 
         msg = "Solution time must be greater than or equal to zero"
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError, msg=msg):
             TecplotFEZone(
                 "TetGrid",
                 {"X": nodes[:, 0], "Y": nodes[:, 1], "Z": nodes[:, 2]},
@@ -425,7 +425,7 @@ class TestTecplotIO(unittest.TestCase):
             )
 
         msg = "Strand ID must be an integer"
-        with self.assertRaises(TypeError):
+        with self.assertRaises(TypeError, msg=msg):
             TecplotFEZone(
                 "TetGrid",
                 {"X": nodes[:, 0], "Y": nodes[:, 1], "Z": nodes[:, 2]},
@@ -435,7 +435,7 @@ class TestTecplotIO(unittest.TestCase):
             )
 
         msg = "Data values must be numpy arrays."
-        with self.assertRaises(TypeError):
+        with self.assertRaises(TypeError, msg=msg):
             TecplotFEZone(
                 "TetGrid",
                 {"X": nodes[:, 0].tolist(), "Y": nodes[:, 1].tolist(), "Z": nodes[:, 2].tolist()},
@@ -444,11 +444,11 @@ class TestTecplotIO(unittest.TestCase):
             )
 
         msg = "Data must be a dictionary."
-        with self.assertRaises(TypeError):
+        with self.assertRaises(TypeError, msg=msg):
             TecplotFEZone("TetGrid", nodes, connectivity, zoneType=ZoneType.FETETRAHEDRON)
 
         msg = "All variables must have the same shape."
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError, msg=msg):
             TecplotFEZone(
                 "TetGrid",
                 {"X": nodes[:, 0], "Y": nodes[:, 1], "Z": nodes[:-1, 2]},
@@ -457,7 +457,7 @@ class TestTecplotIO(unittest.TestCase):
             )
 
         msg = "Connectivity shape does not match zone type."
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(AssertionError, msg=msg):
             TecplotFEZone(
                 "TetGrid",
                 {"X": nodes[:, 0], "Y": nodes[:, 1], "Z": nodes[:, 2]},
